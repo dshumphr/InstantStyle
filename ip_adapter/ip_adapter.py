@@ -24,6 +24,8 @@ else:
     from .attention_processor import AttnProcessor, CNAttnProcessor, IPAttnProcessor
 from .resampler import Resampler
 
+from itertools import zip_longest
+
 
 class ImageProjModel(torch.nn.Module):
     """Projection Model"""
@@ -152,12 +154,33 @@ class IPAdapter:
         ip_layers.load_state_dict(state_dict["ip_adapter"], strict=False)
 
     @torch.inference_mode()
-    def get_image_embeds(self, pil_image=None, clip_image_embeds=None, content_prompt_embeds=None):
-        if pil_image is not None:
-            if isinstance(pil_image, Image.Image):
-                pil_image = [pil_image]
-            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
+    def get_image_embeds(self, pil_images=None, clip_image_embeds=None, content_prompt_embeds=None, weights=None):
+        # Method now accepts a 'weights' parameter for weighted averaging
+        if pil_images is not None:
+            if not isinstance(pil_images, list):
+                pil_images = [pil_images]  # Ensure input is a list
+
+            if weights is None:
+                weights = torch.ones(len(pil_images), dtype=torch.float32, device=self.device) / len(pil_images)
+            if len(weights) != len(pil_images):
+                raise ValueError("Weights must be match the number of images.")
+
+            # Normalize weights to ensure they sum up to 1
+            weights = torch.tensor(weights, dtype=torch.float16, device=self.device)
+            weights /= weights.sum()
+
+            # Process each image, apply weights, and stack embeddings
+            all_embeds = []
+            # TODO batch
+            for i, pil_image in enumerate(pil_images):
+                clip_image = self.clip_image_processor(images=[pil_image], return_tensors="pt").pixel_values
+                clip_image_embeds_single = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
+                weighted_embed = clip_image_embeds_single * weights[i]
+                all_embeds.append(weighted_embed)
+            
+            # Sum the weighted embeddings to get the weighted average
+            clip_image_embeds = torch.sum(torch.stack(all_embeds), dim=0)
+
         else:
             clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
         
@@ -205,7 +228,7 @@ class IPAdapter:
             negative_prompt = [negative_prompt] * num_prompts
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(
-            pil_image=pil_image, clip_image_embeds=clip_image_embeds, content_prompt_embeds=neg_content_emb
+            pil_images=pil_image, clip_image_embeds=clip_image_embeds, content_prompt_embeds=neg_content_emb
         )
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
@@ -240,7 +263,6 @@ class IPAdapter:
 
 class IPAdapterXL(IPAdapter):
     """SDXL"""
-
     def generate(
         self,
         pil_image,
@@ -253,21 +275,38 @@ class IPAdapterXL(IPAdapter):
         neg_content_emb=None,
         neg_content_prompt=None,
         neg_content_scale=1.0,
+        pil_image_weights=None,
+        prompt_weights=None,
+        neg_prompt_weights=None,
         **kwargs,
     ):
         self.set_scale(scale)
 
-        num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
-
         if prompt is None:
-            prompt = "best quality, high quality"
+            prompt = ["best quality, high quality"]
         if negative_prompt is None:
-            negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
+            negative_prompt = ["monochrome, lowres, bad anatomy, worst quality, low quality"]
 
-        if not isinstance(prompt, List):
-            prompt = [prompt] * num_prompts
-        if not isinstance(negative_prompt, List):
-            negative_prompt = [negative_prompt] * num_prompts
+        if prompt_weights is not None:
+            if len(prompt_weights) != len(prompt):
+                raise ValueError("The number of weights must match the number of prompts.")
+            prompt_weights = torch.tensor(prompt_weights, dtype=torch.float16, device=self.device)
+            prompt_weights /= prompt_weights.sum()
+        else:
+            prompt_weights = torch.ones(len(prompt), dtype=torch.float16, device=self.device) / len(prompt)
+        if neg_prompt_weights is not None:
+            if len(prompt_weights) != len(prompt):
+                raise ValueError("The number of weights must match the number of negative prompts.")
+            neg_prompt_weights = torch.tensor(neg_prompt_weights, dtype=torch.float16, device=self.device)
+            neg_prompt_weights /= neg_prompt_weights.sum()
+        else:
+            neg_prompt_weights = torch.ones(len(negative_prompt), dtype=torch.float16, device=self.device) / len(negative_prompt)
+        while len(prompt) < len(negative_prompt):
+            prompt.append("")
+        while len(negative_prompt) < len(prompt):
+            negative_prompt.append("")
+        torch.cat((prompt_weights, torch.zeros(len(prompt)-len(prompt_weights), device=self.device)), dim=0)
+        torch.cat((neg_prompt_weights, torch.zeros(len(negative_prompt)-len(neg_prompt_weights), device=self.device)), dim=0)
         
         if neg_content_emb is None:
             if neg_content_prompt is not None:
@@ -289,7 +328,7 @@ class IPAdapterXL(IPAdapter):
         else:
             pooled_prompt_embeds_ = None
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, content_prompt_embeds=pooled_prompt_embeds_)
+        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, content_prompt_embeds=pooled_prompt_embeds_, weights=pil_image_weights)
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
@@ -308,8 +347,16 @@ class IPAdapterXL(IPAdapter):
                 do_classifier_free_guidance=True,
                 negative_prompt=negative_prompt,
             )
-            prompt_embeds = torch.cat([prompt_embeds, image_prompt_embeds], dim=1)
-            negative_prompt_embeds = torch.cat([negative_prompt_embeds, uncond_image_prompt_embeds], dim=1)
+            # Sum the weighted embeddings to get the weighted average
+            prompt_embeds = torch.einsum('n,nab->ab', prompt_weights, prompt_embeds)
+            prompt_embeds = torch.cat([prompt_embeds, image_prompt_embeds.squeeze(0)], dim=0)
+            prompt_embeds = torch.unsqueeze(prompt_embeds, 0)
+            negative_prompt_embeds = torch.einsum('n,nab->ab', neg_prompt_weights, negative_prompt_embeds)
+            negative_prompt_embeds = torch.cat([negative_prompt_embeds, uncond_image_prompt_embeds.squeeze(0)], dim=0)
+            negative_prompt_embeds = torch.unsqueeze(negative_prompt_embeds, 0)
+            pooled_prompt_embeds = torch.mean(pooled_prompt_embeds, 0, True)
+            negative_pooled_prompt_embeds = torch.mean(negative_pooled_prompt_embeds, 0, True)
+
 
         self.generator = get_generator(seed, self.device)
         
@@ -324,7 +371,6 @@ class IPAdapterXL(IPAdapter):
         ).images
 
         return images
-
 
 class IPAdapterPlus(IPAdapter):
     """IP-Adapter with fine-grained features"""
