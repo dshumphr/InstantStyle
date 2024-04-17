@@ -17,6 +17,8 @@ InstantX Team
 
 InstantStyle is a general framework that employs two straightforward yet potent techniques for achieving an effective disentanglement of style and content from reference images.
 
+Note: This fork is experimental - mainly exploring using multiple weighted images to supply style info.
+
 <img src='assets/pipe.png'>
 
 ## Principle
